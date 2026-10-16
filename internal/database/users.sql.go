@@ -7,7 +7,34 @@ package database
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
+
+const createChirp = `-- name: CreateChirp :one
+INSERT INTO chirps (id, created_at, updated_at, body, user_id)
+VALUES (
+    gen_random_uuid(), NOW(), NOW(), $1, $2
+)RETURNING id, created_at, updated_at, body, user_id
+`
+
+type CreateChirpParams struct {
+	Body   string
+	UserID uuid.NullUUID
+}
+
+func (q *Queries) CreateChirp(ctx context.Context, arg CreateChirpParams) (Chirp, error) {
+	row := q.db.QueryRowContext(ctx, createChirp, arg.Body, arg.UserID)
+	var i Chirp
+	err := row.Scan(
+		&i.ID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Body,
+		&i.UserID,
+	)
+	return i, err
+}
 
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (id, created_at, updated_at, email)
@@ -30,10 +57,62 @@ func (q *Queries) CreateUser(ctx context.Context, email string) (User, error) {
 }
 
 const deleteUser = `-- name: DeleteUser :exec
-TRUNCATE TABLE users
+DELETE FROM users
 `
 
 func (q *Queries) DeleteUser(ctx context.Context) error {
 	_, err := q.db.ExecContext(ctx, deleteUser)
 	return err
+}
+
+const listAllChirps = `-- name: ListAllChirps :many
+select id, created_at, updated_at, body, user_id FROM chirps order by created_at
+`
+
+func (q *Queries) ListAllChirps(ctx context.Context) ([]Chirp, error) {
+	rows, err := q.db.QueryContext(ctx, listAllChirps)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Chirp
+	for rows.Next() {
+		var i Chirp
+		if err := rows.Scan(
+			&i.ID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Body,
+			&i.UserID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listChirp = `-- name: ListChirp :one
+select id, created_at, updated_at, body, user_id FROM chirps
+where id = $1
+order by created_at
+`
+
+func (q *Queries) ListChirp(ctx context.Context, id uuid.UUID) (Chirp, error) {
+	row := q.db.QueryRowContext(ctx, listChirp, id)
+	var i Chirp
+	err := row.Scan(
+		&i.ID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Body,
+		&i.UserID,
+	)
+	return i, err
 }

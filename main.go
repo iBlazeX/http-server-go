@@ -5,13 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
 	"time"
-	"uuid"
 
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -50,7 +51,9 @@ func main() {
 	})
 	mux.HandleFunc("POST /api/users", apiCfg.serveDB)
 	mux.HandleFunc("POST /admin/reset", apiCfg.reset)
-	mux.HandleFunc("POST /api/validate_chirp", validate)
+	mux.HandleFunc("POST /api/chirps", apiCfg.chirp)
+	mux.HandleFunc("GET /api/chirps", apiCfg.getAllChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)
 	fmt.Printf("\033]8;;%s\033\\%s\033]8;;\033\\\n", "http://localhost:8080", "localhost:8080")
 	serv.ListenAndServe()
 
@@ -77,6 +80,14 @@ type User struct {
 	Email     string    `json:"email"`
 }
 
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	User_ID   uuid.UUID `json:"user_id"`
+}
+
 func (cnf *apiConf) reset(w http.ResponseWriter, r *http.Request) {
 	if cnf.platform == "dev" {
 		err := cnf.dbQueries.DeleteUser(r.Context())
@@ -96,6 +107,7 @@ func (cnf *apiConf) middlewareMetricsInc(next http.Handler) http.Handler {
 }
 
 func respondWithError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("content-type", "application/json")
 	payload := struct {
 		Error string `json:"error"`
 	}{
@@ -110,6 +122,7 @@ func respondWithError(w http.ResponseWriter, status int, msg string) {
 }
 
 func respondWithJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("content-type", "application/json")
 	x, err := json.Marshal(payload)
 	if err != nil {
 		respondWithError(w, 500, "Something went wrong")
@@ -118,30 +131,6 @@ func respondWithJSON(w http.ResponseWriter, status int, payload any) {
 	w.WriteHeader(status)
 
 	w.Write(x)
-}
-
-func validate(w http.ResponseWriter, r *http.Request) {
-	type param struct {
-		Body string `json:"body"`
-	}
-	type resp struct {
-		Cleaned_Body string `json:"cleaned_body"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	var x param
-	err := decoder.Decode(&x)
-	w.Header().Set("content-type", "application/json")
-	if err != nil {
-		respondWithError(w, 400, "Something went wrong")
-	} else if len(x.Body) > 140 {
-		respondWithError(w, 400, "Chirp is too long")
-	} else {
-		res := resp{
-			profane(x.Body),
-		}
-		respondWithJSON(w, 200, res)
-	}
-
 }
 
 func profane(str string) string {
@@ -178,4 +167,73 @@ func (cfg *apiConf) serveDB(w http.ResponseWriter, r *http.Request) {
 		uuid.UUID(u.ID), u.CreatedAt, u.UpdatedAt, u.Email,
 	}
 	respondWithJSON(w, 201, user)
+}
+
+func (cfg *apiConf) chirp(w http.ResponseWriter, r *http.Request) {
+	type request struct {
+		Body    string    `json:"body"`
+		User_ID uuid.UUID `json:"user_id"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	var x request
+	err := decoder.Decode(&x)
+	if err != nil {
+		respondWithError(w, 400, "Bad Request")
+		return
+	} else if len(x.Body) > 140 {
+		respondWithError(w, 400, "Chirp is too long")
+		return
+	} else {
+		data, err := cfg.dbQueries.CreateChirp(r.Context(), database.CreateChirpParams{Body: x.Body, UserID: uuid.NullUUID{
+			UUID:  x.User_ID,
+			Valid: true,
+		}})
+		if err != nil {
+			log.Printf("CreateChirp error: %v", err)
+			respondWithError(w, 500, "Server Error")
+			return
+		}
+		c := Chirp{
+			data.ID, data.CreatedAt, data.UpdatedAt, data.Body, data.UserID.UUID,
+		}
+		respondWithJSON(w, 201, c)
+	}
+}
+
+func (cfg *apiConf) getAllChirps(w http.ResponseWriter, r *http.Request) {
+	data, err := cfg.dbQueries.ListAllChirps(r.Context())
+	if err != nil {
+		respondWithError(w, 500, "Server Error")
+		return
+	}
+	chirps := make([]Chirp, 0, len(data))
+	for _, c := range data {
+		chirps = append(chirps, Chirp{
+			ID:        uuid.UUID(c.ID),
+			CreatedAt: c.CreatedAt,
+			UpdatedAt: c.UpdatedAt,
+			Body:      c.Body,
+			User_ID:   c.UserID.UUID,
+		})
+	}
+	respondWithJSON(w, 200, chirps)
+}
+
+func (cfg *apiConf) getChirp(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("chirpID"))
+	if err != nil {
+		respondWithError(w, 400, "Bad Request")
+		return
+	}
+
+	data, err := cfg.dbQueries.ListChirp(r.Context(), id)
+	if err != nil {
+		respondWithError(w, 404, "Chirp Not Found")
+		return
+	}
+	c := Chirp{
+		data.ID, data.CreatedAt, data.UpdatedAt, data.Body, data.UserID.UUID,
+	}
+	respondWithJSON(w, 200, c)
 }
