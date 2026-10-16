@@ -1,16 +1,28 @@
 package main
 
 import (
+	"MODULE_PATH/internal/database"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+	"time"
+	"uuid"
 
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
 func main() {
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		fmt.Printf("Error fetching database")
+	}
 	mux := http.NewServeMux()
 
 	serv := http.Server{
@@ -19,7 +31,7 @@ func main() {
 	}
 
 	apiCfg := apiConf{
-		atomic.Int32{},
+		atomic.Int32{}, database.New(db), User{}, os.Getenv("PLATFORM"),
 	}
 
 	fsv := http.FileServer(http.Dir("."))
@@ -36,9 +48,8 @@ func main() {
 		w.Header().Set("content-type", "text/html")
 		w.Write([]byte(body))
 	})
-	mux.HandleFunc("POST /admin/reset", func(w http.ResponseWriter, r *http.Request) {
-		apiCfg.fileserverHits.Store(0)
-	})
+	mux.HandleFunc("POST /api/users", apiCfg.serveDB)
+	mux.HandleFunc("POST /admin/reset", apiCfg.reset)
 	mux.HandleFunc("POST /api/validate_chirp", validate)
 	fmt.Printf("\033]8;;%s\033\\%s\033]8;;\033\\\n", "http://localhost:8080", "localhost:8080")
 	serv.ListenAndServe()
@@ -54,6 +65,27 @@ func SrvHTTP(w http.ResponseWriter, req *http.Request) {
 
 type apiConf struct {
 	fileserverHits atomic.Int32
+	dbQueries      *database.Queries
+	user           User
+	platform       string
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+func (cnf *apiConf) reset(w http.ResponseWriter, r *http.Request) {
+	if cnf.platform == "dev" {
+		err := cnf.dbQueries.DeleteUser(r.Context())
+		if err != nil {
+			respondWithError(w, 500, "Server Error")
+		}
+	} else {
+		respondWithError(w, 403, "Forbidden")
+	}
 }
 
 func (cnf *apiConf) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -123,4 +155,27 @@ func profane(str string) string {
 		}
 	}
 	return strings.Join(arr, " ")
+}
+
+func (cfg *apiConf) serveDB(w http.ResponseWriter, r *http.Request) {
+	type request struct {
+		Email string `json:"email"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	var x request
+	err := decoder.Decode(&x)
+	if err != nil {
+		respondWithError(w, 400, "Bad Request")
+		return
+	}
+	u, err := cfg.dbQueries.CreateUser(r.Context(), x.Email)
+	if err != nil {
+		respondWithError(w, 500, "Server Error")
+		return
+	}
+
+	user := User{
+		uuid.UUID(u.ID), u.CreatedAt, u.UpdatedAt, u.Email,
+	}
+	respondWithJSON(w, 201, user)
 }
