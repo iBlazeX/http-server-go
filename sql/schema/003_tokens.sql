@@ -1,6 +1,6 @@
 -- +goose Up
-CREATE TABLE tokens(
-	token string primary key,
+CREATE TABLE refresh_tokens(
+	token text primary key,
 	created_at timestamp not null,
 	updated_at timestamp not null,
 	user_id uuid,
@@ -11,4 +11,4 @@ constraint fk_user
 	on delete cascade);
 
 -- +goose Down
-DROP TABLE tokens;
+DROP TABLE refresh_tokens;
