@@ -1,6 +1,7 @@
 package main
 
 import (
+	"MODULE_PATH/internal/auth"
 	"MODULE_PATH/internal/database"
 	"database/sql"
 	"encoding/json"
@@ -24,6 +25,7 @@ func main() {
 	if err != nil {
 		fmt.Printf("Error fetching database")
 	}
+	jwt_secret := os.Getenv("JWT_SECRET")
 	mux := http.NewServeMux()
 
 	serv := http.Server{
@@ -32,7 +34,7 @@ func main() {
 	}
 
 	apiCfg := apiConf{
-		atomic.Int32{}, database.New(db), User{}, os.Getenv("PLATFORM"),
+		atomic.Int32{}, database.New(db), User{}, os.Getenv("PLATFORM"), jwt_secret,
 	}
 
 	fsv := http.FileServer(http.Dir("."))
@@ -54,6 +56,7 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", apiCfg.chirp)
 	mux.HandleFunc("GET /api/chirps", apiCfg.getAllChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)
+	mux.HandleFunc("POST /api/login", apiCfg.login)
 	fmt.Printf("\033]8;;%s\033\\%s\033]8;;\033\\\n", "http://localhost:8080", "localhost:8080")
 	serv.ListenAndServe()
 
@@ -71,6 +74,7 @@ type apiConf struct {
 	dbQueries      *database.Queries
 	user           User
 	platform       string
+	jwt_secret     string
 }
 
 type User struct {
@@ -88,9 +92,9 @@ type Chirp struct {
 	User_ID   uuid.UUID `json:"user_id"`
 }
 
-func (cnf *apiConf) reset(w http.ResponseWriter, r *http.Request) {
-	if cnf.platform == "dev" {
-		err := cnf.dbQueries.DeleteUser(r.Context())
+func (cfg *apiConf) reset(w http.ResponseWriter, r *http.Request) {
+	if cfg.platform == "dev" {
+		err := cfg.dbQueries.DeleteUser(r.Context())
 		if err != nil {
 			respondWithError(w, 500, "Server Error")
 		}
@@ -99,11 +103,60 @@ func (cnf *apiConf) reset(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (cnf *apiConf) middlewareMetricsInc(next http.Handler) http.Handler {
+func (cfg *apiConf) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cnf.fileserverHits.Add(1)
+		cfg.fileserverHits.Add(1)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (cfg *apiConf) login(w http.ResponseWriter, r *http.Request) {
+	type request struct {
+		Email      string `json:"email"`
+		Password   string `json:"password"`
+		Expires_in int    `json:"expires_in_seconds"`
+	}
+
+	type response struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+		Token     string    `json:"token"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	var x request
+	err := decoder.Decode(&x)
+	if err != nil {
+		respondWithError(w, 400, "Bad Request")
+		return
+	}
+
+	data, err := cfg.dbQueries.ListUser(r.Context(), x.Email)
+	pass, _ := auth.CheckPasswordHash(x.Password, data.HashedPassword)
+	if err != nil || !pass {
+		respondWithError(w, 401, "Unauthorized")
+		return
+	}
+	var t time.Duration
+	if x.Expires_in == 0 {
+		t = time.Hour
+	} else {
+		t = time.Duration(x.Expires_in) * time.Second
+	}
+
+	token, err := auth.MakeJWT(data.ID, cfg.jwt_secret, t)
+	if err != nil {
+		respondWithError(w, 400, "Server error")
+		return
+	}
+
+	res := response{
+		data.ID, data.CreatedAt, data.UpdatedAt, data.Email, token,
+	}
+
+	respondWithJSON(w, 200, res)
 }
 
 func respondWithError(w http.ResponseWriter, status int, msg string) {
@@ -148,7 +201,8 @@ func profane(str string) string {
 
 func (cfg *apiConf) serveDB(w http.ResponseWriter, r *http.Request) {
 	type request struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	decoder := json.NewDecoder(r.Body)
 	var x request
@@ -157,7 +211,12 @@ func (cfg *apiConf) serveDB(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, 400, "Bad Request")
 		return
 	}
-	u, err := cfg.dbQueries.CreateUser(r.Context(), x.Email)
+	hash, err := auth.HashPassword(x.Password)
+	if err != nil {
+		respondWithError(w, 500, "Server Error")
+		return
+	}
+	u, err := cfg.dbQueries.CreateUser(r.Context(), database.CreateUserParams{Email: x.Email, HashedPassword: hash})
 	if err != nil {
 		respondWithError(w, 500, "Server Error")
 		return
@@ -175,9 +234,21 @@ func (cfg *apiConf) chirp(w http.ResponseWriter, r *http.Request) {
 		User_ID uuid.UUID `json:"user_id"`
 	}
 
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, 500, "Server Error")
+		return
+	}
+
+	uid, err := auth.ValidateJWT(token, cfg.jwt_secret)
+	if err != nil {
+		respondWithError(w, 500, "Server Error")
+		return
+	}
 	decoder := json.NewDecoder(r.Body)
 	var x request
-	err := decoder.Decode(&x)
+	err = decoder.Decode(&x)
+
 	if err != nil {
 		respondWithError(w, 400, "Bad Request")
 		return
@@ -186,7 +257,7 @@ func (cfg *apiConf) chirp(w http.ResponseWriter, r *http.Request) {
 		return
 	} else {
 		data, err := cfg.dbQueries.CreateChirp(r.Context(), database.CreateChirpParams{Body: x.Body, UserID: uuid.NullUUID{
-			UUID:  x.User_ID,
+			UUID:  uid,
 			Valid: true,
 		}})
 		if err != nil {
